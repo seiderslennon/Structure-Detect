@@ -1,0 +1,21 @@
+data:
+  data_root: '/data/SONICS/dataset_50k/combined_songs.csv'
+  sample_rate: 16000
+  duration: 60
+  random_sample: True
+  whisper_size: 'tiny'
+  crepe_size: 'tiny'
+
+model:
+  max_tokens_per_modality: 4096
+
+train:
+  batch_size: 8
+  learning_rate: 1e-4
+  weight_decay: 1e-3
+  num_workers: 0
+  max_epochs: 100
+  precision: '16-mixed'
+  accumulate_grad_batches: 4
+  pin_memory: False
+  
