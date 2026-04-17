@@ -1,0 +1,3 @@
+[submodule "ISMIR2019-Large-Vocabulary-Chord-Recognition"]
+	path = ISMIR2019-Large-Vocabulary-Chord-Recognition
+	url = https://github.com/seiderslennon/ISMIR2019-Large-Vocabulary-Chord-Recognition.git

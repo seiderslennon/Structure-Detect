@@ -147,8 +147,14 @@ class AudioDataset():
         if self.sr != 22050:
             resampler = torchaudio.transforms.Resample(self.sr, 22050)
             clip = resampler(clip)
-        
-        spect = self.bt_spec_extractor(clip.to('cuda'))
+
+        mono = clip.to('cuda')
+        if mono.ndim == 2:
+            mono = mono.mean(dim=0) if mono.shape[0] > 1 else mono.squeeze(0)
+        elif mono.ndim != 1:
+            raise ValueError(f"Expected 1D or 2D audio, got shape {tuple(mono.shape)}")
+
+        spect = self.bt_spec_extractor(mono).unsqueeze(0)
         with torch.inference_mode():
             model_output = self.beat_this(spect)
             beat_embedding = model_output["feat"]
