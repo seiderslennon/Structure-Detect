@@ -1,0 +1,87 @@
+---------------------------------------
+Begin Slurm Prolog: Apr-21-2026 23:02:39
+Job ID:    6886671
+User ID:   lseiders3
+Account:   gts-gw92-paid
+Job name:  aimusic-train
+Partition: gpu-h200
+QOS:       inferno
+---------------------------------------
+SLURM_JOB_ID=6886671
+SLURM_NODELIST=atl1-1-01-009-9-0
+CUDA_VISIBLE_DEVICES=0
+Running from: /storage/home/hcoda1/3/lseiders3/AIGM-Detection/Structure-Detect
+
+============================================================
+Total dataset - Real: 47286, Fake: 47285
+WARNING: feature_extractor_cqt requires the libray 'nnAudio'
+train size: 85113
+
+============================================================
+Total dataset - Real: 47286, Fake: 47285
+val size: 9458
+SpecTTTraAttentionClassifier(
+  (tokenizer): FeatureTokenizer(
+    (tokenizer): Tokenizer1D(
+      (conv1d): Conv1d(512, 512, kernel_size=(5,), stride=(5,))
+      (act): GELU(approximate='none')
+      (pos_encoder): SinusoidPositionalEncoding()
+      (norm_pre): Identity()
+    )
+  )
+  (pos_drop): Dropout(p=0.0, inplace=False)
+  (transformer): Transformer(
+    (blocks): ModuleList(
+      (0-5): 6 x TransformerBlock(
+        (norm1): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=512, out_features=1536, bias=False)
+          (q_norm): Identity()
+          (k_norm): Identity()
+          (attn_drop): Dropout(p=0.0, inplace=False)
+          (proj): Linear(in_features=512, out_features=512, bias=True)
+          (proj_drop): Dropout(p=0.0, inplace=False)
+        )
+        (ls1): Identity()
+        (drop_path1): Identity()
+        (norm2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (mlp): Mlp(
+          (fc1): Linear(in_features=512, out_features=2048, bias=True)
+          (act): GELU(approximate='none')
+          (drop1): Dropout(p=0.0, inplace=False)
+          (norm): Identity()
+          (fc2): Linear(in_features=2048, out_features=512, bias=True)
+          (drop2): Dropout(p=0.0, inplace=False)
+        )
+        (ls2): Identity()
+        (drop_path2): Identity()
+      )
+    )
+  )
+  (classifier): Linear(in_features=512, out_features=2, bias=True)
+)
+┏━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃   ┃ Name       ┃ Type                         ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0 │ classifier │ SpecTTTraAttentionClassifier │ 20.2 M │ train │     0 │
+│ 1 │ fuser      │ MultiModalMERTFusion         │ 14.4 M │ train │     0 │
+└───┴────────────┴──────────────────────────────┴────────┴───────┴───────┘
+Trainable params: 34.6 M                                                        
+Non-trainable params: 0                                                         
+Total params: 34.6 M                                                            
+Total estimated model params size (MB): 138                                     
+Modules in train mode: 194                                                      
+Modules in eval mode: 0                                                         
+Total FLOPs: 0                                                                  
+---------------------------------------
+Begin Slurm Epilog: Apr-22-2026 07:02:42
+Job ID:        6886671
+User ID:       lseiders3
+Account:       gts-gw92-paid
+Job name:      aimusic-train
+Resources:     cpu=8,gres/gpu:h200=1,mem=64G,node=1
+Rsrc Used:     cput=2-16:00:32,vmem=0,walltime=08:00:04,mem=20750536K,energy_used=0
+Partition:     gpu-h200
+QOS:           inferno
+Nodes:         atl1-1-01-009-9-0
+---------------------------------------

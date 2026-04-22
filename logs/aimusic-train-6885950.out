@@ -1,0 +1,25 @@
+---------------------------------------
+Begin Slurm Prolog: Apr-21-2026 22:59:52
+Job ID:    6885950
+User ID:   lseiders3
+Account:   gts-gw92-paid
+Job name:  aimusic-train
+Partition: gpu-h200
+QOS:       inferno
+---------------------------------------
+SLURM_JOB_ID=6885950
+SLURM_NODELIST=atl1-1-01-007-7-0
+CUDA_VISIBLE_DEVICES=0
+Running from: /storage/home/hcoda1/3/lseiders3/AIGM-Detection/Structure-Detect
+---------------------------------------
+Begin Slurm Epilog: Apr-21-2026 23:02:32
+Job ID:        6885950
+User ID:       lseiders3
+Account:       gts-gw92-paid
+Job name:      aimusic-train
+Resources:     cpu=8,gres/gpu:h200=1,mem=64G,node=1
+Rsrc Used:     cput=00:18:48,vmem=0,walltime=00:02:21,mem=677292K,energy_used=0
+Partition:     gpu-h200
+QOS:           inferno
+Nodes:         atl1-1-01-007-7-0
+---------------------------------------

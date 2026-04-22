@@ -13,9 +13,15 @@ from ai_music.models import resnet
 from ai_music.data import cross_attention
 
 # Import feature extraction methods from dataset
-sys.path.insert(0, str("/home/lennon/AI_music/ISMIR2019-Large-Vocabulary-Chord-Recognition"))
-sys.path.insert(0, str("/home/lennon/AI_music/beat_this"))
-sys.path.insert(0, "/home/lennon/AI_music")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CHORD_ROOT = PROJECT_ROOT / "ISMIR2019-Large-Vocabulary-Chord-Recognition"
+BEAT_THIS_ROOT = PROJECT_ROOT / "beat_this"
+
+for path in (CHORD_ROOT, BEAT_THIS_ROOT, PROJECT_ROOT):
+    path_str = str(path)
+    if path.exists() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from beat_this.inference import load_model, LogMelSpect
 from feature_extractor import FeatureExtractor
 from transformers import Wav2Vec2FeatureExtractor
@@ -51,7 +57,7 @@ class InferenceDataset(Dataset):
         # Initialize models
         self.whisper = whisper.load_model(self.whisper_size, device='cuda')
         self.chordnet = FeatureExtractor()
-        self.beat_this = load_model('/home/lennon/AI_music/beat_this/final0.ckpt', device='cuda')
+        self.beat_this = load_model(str(BEAT_THIS_ROOT / "final0.ckpt"), device='cuda')
         self.bt_spec_extractor = LogMelSpect(
             sample_rate=22050,
             n_fft=1024,
@@ -255,8 +261,11 @@ def main():
     parser.add_argument('input_path', type=str, 
                         help='Path to song directory (containing vocals.wav and accompaniment.wav) or folder containing multiple song directories')
     # parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, default='/home/lennon/AI_music/ai_music/configs/cross_attn_resnet.yaml',
+    parser.add_argument('--config', type=str, default=str(PROJECT_ROOT / 'ai_music/configs/cross_attn_resnet.yaml'),
                         help='Path to config file')
+    parser.add_argument('--checkpoint', type=str,
+                        default=str(PROJECT_ROOT / 'lightning_logs/version_227/checkpoints/epoch=4-step=8510.ckpt'),
+                        help='Path to model checkpoint')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
     
     args = parser.parse_args()
@@ -283,8 +292,7 @@ def main():
     # Load model once (shared across all songs)
     print("\nLoading model...")
     model = LightningModel.load_from_checkpoint(
-        # args.checkpoint,
-        "/home/lennon/AI_music/lightning_logs/version_227/checkpoints/epoch=4-step=8510.ckpt",
+        args.checkpoint,
         classifier=resnet.ResNet(max_tokens_per_modality=model_config['max_tokens_per_modality']),
         fuser=cross_attention.MultiModalMERTFusion(use_layer_mix=True),
         configs=train_config,

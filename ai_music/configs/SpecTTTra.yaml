@@ -1,5 +1,5 @@
 data:
-  data_root: '/data/SONICS/dataset_50k/combined_songs.csv'
+  data_root: '/storage/home/hcoda1/3/lseiders3/scratch/Sonics-Dataset/dataset_50k/combined_songs.csv'
   sample_rate: 16000
   duration: 60
   random_sample: True
@@ -14,7 +14,7 @@ train:
   learning_rate: 1e-4
   weight_decay: 1e-3
   num_workers: 0
-  max_epochs: 100
+  max_epochs: 3
   precision: '16-mixed'
   accumulate_grad_batches: 4
   pin_memory: False

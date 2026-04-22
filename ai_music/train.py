@@ -7,6 +7,9 @@ from ai_music.data import cross_attention
 import yaml
 from ai_music.utils import log_print
 from ai_music.data.dataset import get_dataloader
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class LightningModel(L.LightningModule):
     def __init__(self, classifier, fuser, configs):
@@ -101,7 +104,7 @@ class LightningModel(L.LightningModule):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='/home/lennon/AI_music/ai_music/configs/SpecTTTra.yaml')
+    parser.add_argument('--config', type=str, default=str(PROJECT_ROOT / 'ai_music/configs/SpecTTTra.yaml'))
     args = parser.parse_args()
 
     with open(args.config) as f:

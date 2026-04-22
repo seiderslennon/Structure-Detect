@@ -1,8 +1,15 @@
 import sys
-sys.path.insert(0, str("/home/lennon/AI_music/ISMIR2019-Large-Vocabulary-Chord-Recognition"))
-# sys.path.insert(0, str("/home/lennon/AI_music/beat_this"))
-sys.path.insert(0, str("/home/lennon/AI_music/beat_this/beat_this")) # different path for submodule setup
-sys.path.insert(0, "/home/lennon/AI_music")
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CHORD_ROOT = PROJECT_ROOT / "ISMIR2019-Large-Vocabulary-Chord-Recognition"
+BEAT_THIS_ROOT = PROJECT_ROOT / "beat_this"
+
+for path in (CHORD_ROOT, BEAT_THIS_ROOT, PROJECT_ROOT):
+    path_str = str(path)
+    if path.exists() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from beat_this.inference import load_model, LogMelSpect
 from feature_extractor import FeatureExtractor
 
@@ -16,7 +23,6 @@ import torchaudio
 import torchcrepe
 import whisper
 import pandas as pd
-from pathlib import Path
 import os
 import warnings
 from tqdm import tqdm
@@ -57,7 +63,7 @@ class AudioDataset():
         if self.chordnet is None:
             self.chordnet = FeatureExtractor()
         if self.beat_this is None:
-            self.beat_this = load_model('/home/lennon/AI_music/beat_this/final0.ckpt', device='cuda')
+            self.beat_this = load_model(str(BEAT_THIS_ROOT / "final0.ckpt"), device='cuda')
             self.bt_spec_extractor = LogMelSpect(
                 sample_rate=22050,
                 n_fft=1024,
