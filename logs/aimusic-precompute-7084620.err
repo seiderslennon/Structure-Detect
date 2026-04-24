@@ -1,0 +1,3 @@
+/storage/home/hcoda1/3/lseiders3/scratch/conda_envs/aigm/lib/python3.10/site-packages/pydub/utils.py:170: RuntimeWarning: Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work
+  warn("Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work", RuntimeWarning)
+[2026-04-22T10:04:00.948] error: *** JOB 7084620 ON atl1-1-01-009-9-0 CANCELLED AT 2026-04-22T10:04:00 DUE to SIGNAL Terminated ***

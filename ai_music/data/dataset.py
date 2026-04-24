@@ -36,6 +36,15 @@ class AudioDataset():
         self.random_sample = data_configs["random_sample"]
         self.whisper_size = data_configs["whisper_size"]
         self.crepe_size = data_configs["crepe_size"]
+        self.train_split_ratio = float(data_configs.get("train_split_ratio", 0.8))
+        self.val_split_ratio = float(data_configs.get("val_split_ratio", 0.1))
+        self.feature_cache_dir = (
+            Path(data_configs["feature_cache_dir"]).expanduser()
+            if data_configs.get("feature_cache_dir")
+            else None
+        )
+        self.use_feature_cache = bool(data_configs.get("use_feature_cache", False))
+        self.write_feature_cache = bool(data_configs.get("write_feature_cache", False))
         
         self.whisper = None
         self.chordnet = None
@@ -51,8 +60,10 @@ class AudioDataset():
         mask = df.apply(lambda row: file_pair_exists(row, self.pathext), axis=1)
         self.df = df[mask].reset_index(drop=True)
         self.get_tracks(split)
-        
-        self._init_models()
+
+        # If cache is read-only, don't eagerly initialize heavy models.
+        if not (self.use_feature_cache and not self.write_feature_cache):
+            self._init_models()
         print(split, "size:", self.__len__())
     
     def _init_models(self):
@@ -82,10 +93,16 @@ class AudioDataset():
         return len(self.tracks)
     
     def __getitem__(self, idx):
+        idx_row = self.tracks.iloc[idx]
+        cache_path = self._cache_path(idx_row)
+
+        if self.use_feature_cache and cache_path is not None and cache_path.exists():
+            cached_embeddings = self._load_cached_embeddings(cache_path)
+            return {"emb": cached_embeddings, "label": idx_row["source"]}
+
         if not self._models_initialized:
             self._init_models()
-            
-        idx_row = self.tracks.iloc[idx]
+
         v_path = self.pathext / idx_row['source'] / idx_row['filename'] / 'vocals.wav'
         a_path = self.pathext / idx_row['source'] / idx_row['filename'] / 'accompaniment.wav'
 
@@ -121,7 +138,25 @@ class AudioDataset():
         sample = {"emb": embeddings,
                   "label": idx_row['source']}
 
+        if self.write_feature_cache and cache_path is not None:
+            self._save_cached_embeddings(cache_path, embeddings)
+
         return sample
+
+    def _cache_path(self, idx_row):
+        if self.feature_cache_dir is None:
+            return None
+        return self.feature_cache_dir / idx_row["source"] / f"{idx_row['filename']}.pt"
+
+    def _load_cached_embeddings(self, cache_path):
+        cached = torch.load(cache_path, map_location="cpu")
+        return tuple(cached["emb"])
+
+    def _save_cached_embeddings(self, cache_path, embeddings):
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Store CPU tensors to keep cache portable across devices.
+        cached_embeddings = tuple(t.detach().cpu() for t in embeddings)
+        torch.save({"emb": cached_embeddings}, cache_path)
     
     def _pitch_emb(self, clip):
         # "tiny"=32, "full"=64
@@ -175,7 +210,13 @@ class AudioDataset():
         return mert_all_layer_hidden_states
     
     def get_tracks(self, split):
-        split_ratio = 0.9
+        split = split.lower()
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"Unknown split '{split}'. Expected train, val, or test.")
+        if self.train_split_ratio <= 0 or self.val_split_ratio < 0:
+            raise ValueError("train_split_ratio must be > 0 and val_split_ratio must be >= 0.")
+        if self.train_split_ratio + self.val_split_ratio >= 1.0:
+            raise ValueError("train_split_ratio + val_split_ratio must be < 1.0 to leave room for test.")
 
         real_df = self.df[self.df['source'] == 'real'].sample(frac=1, random_state=42).reset_index(drop=True)
         fake_df = self.df[self.df['source'] == 'fake'].sample(frac=1, random_state=42).reset_index(drop=True)
@@ -183,13 +224,17 @@ class AudioDataset():
         print(f"\n{'='*60}")
         print(f"Total dataset - Real: {len(real_df)}, Fake: {len(fake_df)}")
         
-        real_split_index = int(split_ratio * len(real_df))
-        real_train = real_df[:real_split_index]
-        real_val = real_df[real_split_index:]
-        
-        fake_split_index = int(split_ratio * len(fake_df))
-        fake_train = fake_df[:fake_split_index]
-        fake_val = fake_df[fake_split_index:]
+        real_train_end = int(self.train_split_ratio * len(real_df))
+        real_val_end = int((self.train_split_ratio + self.val_split_ratio) * len(real_df))
+        real_train = real_df[:real_train_end]
+        real_val = real_df[real_train_end:real_val_end]
+        real_test = real_df[real_val_end:]
+
+        fake_train_end = int(self.train_split_ratio * len(fake_df))
+        fake_val_end = int((self.train_split_ratio + self.val_split_ratio) * len(fake_df))
+        fake_train = fake_df[:fake_train_end]
+        fake_val = fake_df[fake_train_end:fake_val_end]
+        fake_test = fake_df[fake_val_end:]
         
         if split == "train":
             self.tracks = pd.concat([real_train, fake_train], ignore_index=True)
@@ -197,6 +242,9 @@ class AudioDataset():
             
         elif split == "val":
             self.tracks = pd.concat([real_val, fake_val], ignore_index=True)
+            self.tracks = self.tracks.sample(frac=1, random_state=42).reset_index(drop=True)
+        elif split == "test":
+            self.tracks = pd.concat([real_test, fake_test], ignore_index=True)
             self.tracks = self.tracks.sample(frac=1, random_state=42).reset_index(drop=True)
 
 

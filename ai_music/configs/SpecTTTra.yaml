@@ -3,8 +3,13 @@ data:
   sample_rate: 16000
   duration: 60
   random_sample: True
+  train_split_ratio: 0.8
+  val_split_ratio: 0.1
   whisper_size: 'tiny'
   crepe_size: 'tiny'
+  feature_cache_dir: '/storage/home/hcoda1/3/lseiders3/scratch/aigmd_feature_cache'
+  use_feature_cache: True
+  write_feature_cache: False
 
 # model:
 #   max_tokens_per_modality: 4096

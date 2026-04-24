@@ -1,0 +1,29 @@
+---------------------------------------
+Begin Slurm Prolog: Apr-22-2026 18:47:17
+Job ID:    7228407
+User ID:   lseiders3
+Account:   gts-gw92-paid
+Job name:  aimusic-precompute
+Partition: gpu-h100
+QOS:       inferno
+---------------------------------------
+SLURM_JOB_ID=7228407
+SLURM_NODELIST=atl1-1-01-006-29-0
+CUDA_VISIBLE_DEVICES=0
+Running from: /storage/home/hcoda1/3/lseiders3/AIGM-Detection/Structure-Detect
+
+============================================================
+Total dataset - Real: 47286, Fake: 47285
+train size: 75656
+---------------------------------------
+Begin Slurm Epilog: Apr-23-2026 06:47:42
+Job ID:        7228407
+User ID:       lseiders3
+Account:       gts-gw92-paid
+Job name:      aimusic-precompute
+Resources:     cpu=8,gres/gpu:h100=1,mem=64G,node=1
+Rsrc Used:     cput=4-00:03:20,vmem=0,walltime=12:00:25,mem=28836400K,energy_used=0
+Partition:     gpu-h100
+QOS:           inferno
+Nodes:         atl1-1-01-006-29-0
+---------------------------------------

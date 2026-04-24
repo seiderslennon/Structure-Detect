@@ -1,0 +1,30 @@
+---------------------------------------
+Begin Slurm Prolog: Apr-22-2026 10:13:48
+Job ID:    7088259
+User ID:   lseiders3
+Account:   gts-gw92-paid
+Job name:  aimusic-precompute
+Partition: gpu-h200
+QOS:       inferno
+---------------------------------------
+SLURM_JOB_ID=7088259
+SLURM_NODELIST=atl1-1-03-019-14-0
+CUDA_VISIBLE_DEVICES=0
+Running from: /storage/home/hcoda1/3/lseiders3/AIGM-Detection/Structure-Detect
+
+============================================================
+Total dataset - Real: 47286, Fake: 47285
+WARNING: feature_extractor_cqt requires the libray 'nnAudio'
+train size: 75656
+---------------------------------------
+Begin Slurm Epilog: Apr-22-2026 18:14:04
+Job ID:        7088259
+User ID:       lseiders3
+Account:       gts-gw92-paid
+Job name:      aimusic-precompute
+Resources:     cpu=8,gres/gpu:h200=1,mem=64G,node=1
+Rsrc Used:     cput=2-16:02:08,vmem=0,walltime=08:00:16,mem=22797528K,energy_used=0
+Partition:     gpu-h200
+QOS:           inferno
+Nodes:         atl1-1-03-019-14-0
+---------------------------------------
