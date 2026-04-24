@@ -5,7 +5,7 @@ torchvision>=0.15.0,<=0.20.0
 lightning>=2.0.0
 
 # Audio Processing & Feature Extraction
-torchcrepe>=0.3.0
+torchcrepe>=0.0.20
 openai-whisper>=20231117
 librosa>=0.10.0
 
@@ -16,6 +16,8 @@ huggingface-hub>=0.16.0
 # Data Processing
 pandas>=2.0.0,<=2.3.0
 numpy>=1.24.0,<2.0.0
+h5py>=3.16.0
+rotary-embedding-torch>=0.8.9
 
 # Configuration & Utilities
 pyyaml>=6.0
@@ -36,6 +38,7 @@ seaborn>=0.12.0
 # Additional utilities
 pillow>=10.0.0
 requests>=2.31.0
+einops>=0.8.2
 
 # Optional: for distributed training
 # accelerate>=0.20.0

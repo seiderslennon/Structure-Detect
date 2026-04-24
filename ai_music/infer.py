@@ -2,6 +2,7 @@ import lightning as L
 import torch
 import yaml
 import argparse
+import csv
 import sys
 from pathlib import Path
 import torchaudio
@@ -10,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from ai_music.train import LightningModel
 from ai_music.models import resnet
+from ai_music.models.sonics import SpecTTTraAttentionClassifier
 from ai_music.data import cross_attention
 
 # Import feature extraction methods from dataset
@@ -139,8 +141,14 @@ class InferenceDataset(Dataset):
         if self.sr != 22050:
             resampler = torchaudio.transforms.Resample(self.sr, 22050)
             clip = resampler(clip)
-        
-        spect = self.bt_spec_extractor(clip.to('cuda'))
+
+        mono = clip.to('cuda')
+        if mono.ndim == 2:
+            mono = mono.mean(dim=0) if mono.shape[0] > 1 else mono.squeeze(0)
+        elif mono.ndim != 1:
+            raise ValueError(f"Expected 1D or 2D audio, got shape {tuple(mono.shape)}")
+
+        spect = self.bt_spec_extractor(mono).unsqueeze(0)
         with torch.inference_mode():
             model_output = self.beat_this(spect)
             beat_embedding = model_output["feat"]
@@ -250,14 +258,48 @@ def process_single_song(song_dir, data_config, train_config, model_config, model
         return None
 
 
+def write_results_csv(results, output_path):
+    """Write inference results to a CSV file."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "song_dir",
+        "prediction",
+        "prediction_label",
+        "confidence",
+        "real_prob",
+        "fake_prob",
+    ]
+
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            writer.writerow(
+                {
+                    "song_dir": result["song_dir"],
+                    "prediction": result["prediction"],
+                    "prediction_label": "real" if result["prediction"] == 1 else "fake",
+                    "confidence": result["confidence"],
+                    "real_prob": result["real_prob"],
+                    "fake_prob": result["fake_prob"],
+                }
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description='Inference script for AI music model')
     parser.add_argument('input_path', type=str, 
                         help='Path to song directory (containing vocals.wav and accompaniment.wav) or folder containing multiple song directories')
-    # parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, default='/home/lennon/AI_music/ai_music/configs/cross_attn_resnet.yaml',
+    parser.add_argument('--checkpoint', type=str,
+                        default='/home/lennon/AI_music/lightning_logs/spectttra-full-train/checkpoints/epoch=2-step=7980.ckpt',
+                        help='Path to model checkpoint')
+    parser.add_argument('--config', type=str, default='/home/lennon/AI_music/ai_music/configs/SpecTTTra.yaml',
                         help='Path to config file')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
+    parser.add_argument('--csv_out', type=str, default=None,
+                        help='Optional path to write inference summary CSV')
     
     args = parser.parse_args()
     
@@ -282,10 +324,32 @@ def main():
     
     # Load model once (shared across all songs)
     print("\nLoading model...")
+    print(f"Using config: {args.config}")
+    print(f"Using checkpoint: {args.checkpoint}")
+    classifier_type = model_config.get('classifier_type', 'ResNet').lower()
+    if classifier_type == 'resnet':
+        classifier = resnet.ResNet(max_tokens_per_modality=model_config['max_tokens_per_modality'])
+    elif classifier_type == 'spectttra':
+        classifier = SpecTTTraAttentionClassifier(
+            feature_dim=model_config.get('feature_dim'),
+            embed_dim=model_config.get('embed_dim'),
+            num_heads=model_config.get('num_heads'),
+            num_layers=model_config.get('num_layers'),
+            tokenizer_clip_size=model_config.get('tokenizer_clip_size'),
+            num_classes=2,
+            pre_norm=model_config.get('pre_norm'),
+            pe_learnable=model_config.get('pe_learnable'),
+            pos_drop_rate=model_config.get('pos_drop_rate'),
+            attn_drop_rate=model_config.get('attn_drop_rate'),
+            proj_drop_rate=model_config.get('proj_drop_rate'),
+            mlp_ratio=model_config.get('mlp_ratio'),
+        )
+    else:
+        raise ValueError(f"Unknown classifier_type: {classifier_type}. Must be 'ResNet' or 'SpecTTTra'")
+
     model = LightningModel.load_from_checkpoint(
-        # args.checkpoint,
-        "/home/lennon/AI_music/lightning_logs/version_227/checkpoints/epoch=4-step=8510.ckpt",
-        classifier=resnet.ResNet(max_tokens_per_modality=model_config['max_tokens_per_modality']),
+        args.checkpoint,
+        classifier=classifier,
         fuser=cross_attention.MultiModalMERTFusion(use_layer_mix=True),
         configs=train_config,
         map_location='cpu'  # Load to CPU first, then move to GPU if available
@@ -326,6 +390,10 @@ def main():
         print(f"    Prediction: {'real' if result['prediction'] == 1 else 'fake'}")
         print(f"    Confidence: {result['confidence']:.4f}")
         print(f"    Probabilities - Real: {result['real_prob']:.4f}, Fake: {result['fake_prob']:.4f}")
+
+    if args.csv_out:
+        write_results_csv(results, args.csv_out)
+        print(f"\nSaved CSV results to: {args.csv_out}")
     
     print("\n" + "="*60)
     print(f"Total processed: {len(results)}/{len(song_dirs)}")
