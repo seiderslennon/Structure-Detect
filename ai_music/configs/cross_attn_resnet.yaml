@@ -1,6 +1,6 @@
 data:
   data_root: '/data/SONICS/dataset_50k/combined_songs.csv'
-  sample_rate: 16000
+  sample_rate: 24000
   duration: 60
   random_sample: True
   whisper_size: 'tiny'
