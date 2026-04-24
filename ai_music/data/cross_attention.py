@@ -175,7 +175,6 @@ class MultiModalMERTFusion(nn.Module):
         mert_layers: list or stacked tensor of 13 layers -> each [B, Tm, 768]
         masks: optional dict modality -> [B, T] boolean (True=valid)
         mert_mask: optional [B, Tm] boolean (True=valid)
-        pooled: if True, returns pooled vectors per modality
         """
         masks = masks or {}
         out = [
@@ -184,5 +183,83 @@ class MultiModalMERTFusion(nn.Module):
             self.chord(  feats[2],   mert_layers, q_mask=masks.get('chord'),   mert_mask=mert_mask),
             self.beat(   feats[3],    mert_layers, q_mask=masks.get('beat'),    mert_mask=mert_mask)
         ]
+
+        return out
+
+
+class ConcatLinearFusion(nn.Module):
+    """
+    Ablation baseline: replaces cross attention with concat + linear projection.
+    Each modality is projected to out_dim independently (no interaction with MERT
+    via attention). MERT layers are mixed and projected separately.
+    Same output format as MultiModalMERTFusion: list of 4 tensors [B, T, out_dim].
+    """
+    def __init__(self,
+                 out_dim=512,
+                 mert_dim=768,
+                 mert_layers=13):
+        super().__init__()
+        self.out_dim = out_dim
+        self.mixer = ScalarMix(mert_layers)
+
+        # Project each modality + concatenated MERT to out_dim
+        # whisper(384) + mert(768) = 1152 -> out_dim
+        # crepe(256) + mert(768) = 1024 -> out_dim
+        # chord(240) + mert(768) = 1008 -> out_dim
+        # beat(512) + mert(768) = 1280 -> out_dim
+        self.proj_whisper = nn.Sequential(
+            nn.LayerNorm(384 + mert_dim),
+            nn.Linear(384 + mert_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.proj_crepe = nn.Sequential(
+            nn.LayerNorm(256 + mert_dim),
+            nn.Linear(256 + mert_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.proj_chord = nn.Sequential(
+            nn.LayerNorm(240 + mert_dim),
+            nn.Linear(240 + mert_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.proj_beat = nn.Sequential(
+            nn.LayerNorm(512 + mert_dim),
+            nn.Linear(512 + mert_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, feats, mert_layers, masks=None, mert_mask=None):
+        """
+        feats: list of [whisper, crepe, chord, beat] tensors
+        mert_layers: [B, 13, T, 768] or list of 13 tensors
+        Returns: list of 4 tensors [B, T, out_dim], same as MultiModalMERTFusion
+        """
+        # Mix MERT layers -> [B, Tm, 768]
+        mert_mixed = self.mixer(mert_layers)
+
+        out = []
+        for feat, proj in zip(feats, [self.proj_whisper, self.proj_crepe,
+                                       self.proj_chord, self.proj_beat]):
+            B, Tq, Dq = feat.shape
+            Tm = mert_mixed.shape[1]
+
+            # Interpolate MERT to match modality temporal length
+            if Tm != Tq:
+                mert_interp = F.interpolate(
+                    mert_mixed.transpose(1, 2),  # [B, 768, Tm]
+                    size=Tq,
+                    mode='linear',
+                    align_corners=False
+                ).transpose(1, 2)  # [B, Tq, 768]
+            else:
+                mert_interp = mert_mixed
+
+            # Concat modality + MERT along feature dim, then project
+            combined = torch.cat([feat, mert_interp], dim=-1)  # [B, Tq, Dq+768]
+            out.append(proj(combined))  # [B, Tq, out_dim]
 
         return out
