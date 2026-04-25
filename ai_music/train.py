@@ -27,6 +27,8 @@ Usage:
 import torch
 import torch.nn.functional as F
 import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint
+from transformers import AutoModel
 from ai_music.models import resnet
 from ai_music.models.sonics import SpecTTTraAttentionClassifier
 from ai_music.data import cross_attention
@@ -37,6 +39,9 @@ from ai_music.data.cached_dataset import get_cached_dataloader as get_dataloader
 MODALITY_NAMES = ['whisper', 'crepe', 'chord', 'beat']
 MODALITY_INDEX = {name: i for i, name in enumerate(MODALITY_NAMES)}
 
+MERT_SAMPLE_RATE = 24000
+MERT_MODEL_NAME = "m-a-p/MERT-v1-95M"
+
 
 class LightningModel(L.LightningModule):
     def __init__(self, classifier, fuser, configs, ablate_modalities=None):
@@ -46,8 +51,49 @@ class LightningModel(L.LightningModule):
         self.configs = configs
         self.ablate_modalities = ablate_modalities or []
         self.val_step_counter = 0
-        
+
+        # MERT runs on the GPU on each batch. We freeze it (no grads, eval mode)
+        # and exclude its weights from the saved checkpoint via state_dict overrides
+        # below — keeps checkpoints small and backward-compatible with existing ones.
+        self.mert = AutoModel.from_pretrained(MERT_MODEL_NAME, trust_remote_code=True)
+        self.mert.eval()
+        for p in self.mert.parameters():
+            p.requires_grad = False
+
         self.save_hyperparameters(ignore=['classifier', 'fuser'])
+
+    def train(self, mode=True):
+        # Lightning calls .train()/.eval() on the whole module — keep MERT in eval
+        # so dropout/etc inside MERT never activates during training_step.
+        super().train(mode)
+        self.mert.eval()
+        return self
+
+    @staticmethod
+    def _normalize_audio(mix):
+        # Equivalent to Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm:
+        #   (x - x.mean()) / sqrt(x.var(unbiased=False) + 1e-7), per sample.
+        mean = mix.mean(dim=-1, keepdim=True)
+        var = mix.var(dim=-1, keepdim=True, unbiased=False)
+        return (mix - mean) / torch.sqrt(var + 1e-7)
+
+    def _run_mert(self, mix):
+        """mix: (B, T) raw audio at 24kHz on this module's device.
+        Returns: (B, 13, T_m, 768) — same shape ScalarMix expects."""
+        mix = self._normalize_audio(mix)
+        with torch.no_grad():
+            out = self.mert(input_values=mix, output_hidden_states=True)
+        return torch.stack(out.hidden_states, dim=1)
+
+    def _resolve_mert_layers(self, batch):
+        """Backward compatible: training uses batch['mix'] (raw audio),
+        infer.py still passes pre-computed MERT as batch['emb'][4]."""
+        if "mix" in batch and batch["mix"] is not None:
+            return self._run_mert(batch["mix"])
+        emb = batch["emb"]
+        if len(emb) >= 5:
+            return emb[4]
+        raise ValueError("Batch must contain raw 'mix' audio or pre-computed MERT in emb[4].")
 
     def _apply_ablation(self, attention_features):
         """Zero out ablated modalities."""
@@ -56,82 +102,83 @@ class LightningModel(L.LightningModule):
             attention_features[idx] = torch.zeros_like(attention_features[idx])
         return attention_features
 
-    def training_step(self, batch):
-        if batch is None:
-            return None
-        
+    def _step(self, batch, log_prefix):
         feats = [emb.squeeze(1) for emb in batch["emb"][:4]]
-        mert_layers = batch["emb"][4]
-        
+        mert_layers = self._resolve_mert_layers(batch)
+
         attention_features = self.fuser.forward(feats=feats, mert_layers=mert_layers)
         attention_features = self._apply_ablation(attention_features)
-        
-        label_strings = [l for l in batch["label"]]
-        labels = [1 if l == "real" else 0 for l in label_strings]
-        labels = torch.tensor(labels, dtype=torch.long, device=attention_features[0].device)
+
+        labels = torch.tensor(
+            [1 if l == "real" else 0 for l in batch["label"]],
+            dtype=torch.long, device=attention_features[0].device,
+        )
 
         z = self.classifier(attention_features)
         loss = F.cross_entropy(z, labels)
-        
+
         preds = torch.argmax(z, dim=1)
         acc = (preds == labels).float().mean()
-        
-        values = {"train_loss": loss, "train_acc": acc}
-        self.log_dict(values, prog_bar=True, batch_size=len(labels))
-        
+
+        self.log_dict(
+            {f"{log_prefix}_loss": loss, f"{log_prefix}_acc": acc},
+            prog_bar=True, batch_size=len(labels),
+        )
         return loss
+
+    def training_step(self, batch):
+        if batch is None:
+            return None
+        return self._step(batch, "train")
 
     def validation_step(self, batch):
         if batch is None:
             return None
+        return self._step(batch, "val")
 
-        feats = [emb.squeeze(1) for emb in batch["emb"][:4]]
-        mert_layers = batch["emb"][4]
-        
-        attention_features = self.fuser.forward(feats=feats, mert_layers=mert_layers)
-        attention_features = self._apply_ablation(attention_features)
-        
-        label_strings = [l for l in batch["label"]]
-        labels = [1 if l == "real" else 0 for l in label_strings]
-        labels = torch.tensor(labels, dtype=torch.long, device=attention_features[0].device)
-
-        z = self.classifier(attention_features)
-        loss = F.cross_entropy(z, labels)
-        
-        preds = torch.argmax(z, dim=1)
-        acc = (preds == labels).float().mean()
-        
-        values = {"val_loss": loss, "val_acc": acc}
-        self.log_dict(values, prog_bar=True, batch_size=len(labels))
-        
-        return loss
-    
     def predict_step(self, batch, batch_idx):
         if batch is None:
             return None
-            
+
         feats = [emb.squeeze(1) for emb in batch["emb"][:4]]
-        mert_layers = batch["emb"][4]
-        
+        mert_layers = self._resolve_mert_layers(batch)
+
         attention_features = self.fuser.forward(feats=feats, mert_layers=mert_layers)
         attention_features = self._apply_ablation(attention_features)
         z = self.classifier(attention_features)
-        
+
         probs = torch.softmax(z, dim=1)
         preds = torch.argmax(z, dim=1)
-        
+
         return {
             'logits': z,
             'probs': probs,
             'predictions': preds,
-            'labels': batch.get('label', None)
+            'labels': batch.get('label', None),
         }
 
     def configure_optimizers(self):
         lr = float(self.configs['learning_rate'])
         wd = float(self.configs['weight_decay'])
-        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=wd)
+        # Filter out frozen MERT params so Adam doesn't allocate optimizer state for them.
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable, lr=lr, weight_decay=wd)
         return optimizer
+
+    # --- checkpoint compatibility: exclude MERT from state_dict so old
+    # checkpoints (which never had mert.* keys) still load, and new
+    # checkpoints stay small. MERT is reconstructed from pretrained on init.
+    def state_dict(self, *args, **kwargs):
+        sd = super().state_dict(*args, **kwargs)
+        return {k: v for k, v in sd.items() if not k.startswith('mert.')}
+
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        own = super().state_dict()
+        merged = dict(state_dict)
+        for k, v in own.items():
+            if k.startswith('mert.') and k not in merged:
+                merged[k] = v
+        return super().load_state_dict(merged, strict=strict, **kwargs)
     
 
 def main():
@@ -177,6 +224,13 @@ def main():
     
     csv_logger, progress_logger = log_print.print_dataset_statistics(train_loader, val_loader)
 
+    checkpoint_cb = ModelCheckpoint(
+        save_top_k=-1,
+        every_n_epochs=1,
+        save_last=True,
+        filename='{epoch}-{step}',
+    )
+
     trainer = L.Trainer(
         devices=1,
         accelerator="auto",
@@ -184,7 +238,7 @@ def main():
         precision=train_config['precision'],
         accumulate_grad_batches=train_config['accumulate_grad_batches'],
         logger=csv_logger,
-        callbacks=[progress_logger],
+        callbacks=[progress_logger, checkpoint_cb],
         num_sanity_val_steps=5,
     )
 

@@ -1,14 +1,11 @@
 """
-CachedDataset: loads precomputed whisper/crepe/chord/beat from .pt files,
-runs only MERT on-the-fly on the full mix (vocal + accompaniment).
+CachedDataset: loads precomputed whisper/crepe/chord/beat from .pt files
+and returns the raw mix audio for the LightningModule to run MERT on
+in a single batched forward pass during training_step.
 
-Drop-in replacement for AudioDataset. Same batch format, same collate function.
-~5x faster training since only 1 model runs per sample instead of 5.
+The .pt cache format is unchanged from precompute_features.py.
 
 Usage in train.py:
-    # Replace:
-    from ai_music.data.dataset import get_dataloader
-    # With:
     from ai_music.data.cached_dataset import get_cached_dataloader as get_dataloader
 """
 
@@ -17,12 +14,8 @@ sys.path.insert(0, str("/home/lennon/AI_music/ISMIR2019-Large-Vocabulary-Chord-R
 sys.path.insert(0, str("/home/lennon/AI_music/beat_this"))
 sys.path.insert(0, "/home/lennon/AI_music")
 
-from transformers import Wav2Vec2FeatureExtractor
-from transformers import AutoModel
 import torch
-
 from torch.utils.data import DataLoader
-import numpy as np
 import torchaudio
 import pandas as pd
 from pathlib import Path
@@ -33,18 +26,16 @@ warnings.filterwarnings("ignore")
 
 class CachedDataset():
     """
-    Loads precomputed whisper/crepe/chord/beat from .pt files.
-    Runs only MERT on-the-fly on the full mix (vocal + accompaniment).
+    Loads precomputed whisper/crepe/chord/beat from .pt files and returns
+    the raw mix audio waveform. MERT is run on the batched audio inside the
+    LightningModule's training_step so it benefits from batched inference,
+    multi-process dataloading, and mixed-precision autocast.
     """
     def __init__(self, data_configs, split, cache_dir="/data/structture/cached_features"):
         self.paths_csv = Path(data_configs["data_root"])
         self.sr = data_configs["sample_rate"]
         self.duration = data_configs["duration"]
         self.random_sample = data_configs["random_sample"]
-
-        self.mert_model = None
-        self.mert_processor = None
-        self._models_initialized = False
 
         self.pathext = Path(os.path.split(self.paths_csv)[0])
         self.cache_dir = Path(cache_dir) / split
@@ -61,77 +52,66 @@ class CachedDataset():
             axis=1)].reset_index(drop=True)
         after = len(self.tracks)
 
-        self._init_models()
+        # Resamplers built once; workers inherit them via fork.
+        self._resamplers = {}
+
         print(f"{split} size: {after} (cached) ({before - after} skipped, no cache file)")
 
-    def _init_models(self):
-        if self._models_initialized:
-            return
-        if self.mert_model is None:
-            self.mert_model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
-            self.mert_model = self.mert_model.to('cuda')
-            self.mert_processor = Wav2Vec2FeatureExtractor.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
-        self._models_initialized = True
+    def _get_resampler(self, orig_sr, target_sr):
+        key = (orig_sr, target_sr)
+        if key not in self._resamplers:
+            self._resamplers[key] = torchaudio.transforms.Resample(orig_sr, target_sr)
+        return self._resamplers[key]
 
     def __len__(self):
         return len(self.tracks)
 
+    @torch.no_grad()
     def __getitem__(self, idx):
-        if not self._models_initialized:
-            self._init_models()
-
         idx_row = self.tracks.iloc[idx]
         song_id = f"{idx_row['source']}_{idx_row['filename']}"
 
-        # Load cached features (float16 -> float32)
+        # Load cached features (kept fp16 to halve H2D bytes; autocast handles dtype).
+        # .detach() because some entries in the cache files were saved with
+        # requires_grad=True (precompute_features.py didn't always detach), which
+        # breaks DataLoader multiprocessing serialization.
         cached = torch.load(self.cache_dir / f"{song_id}.pt", weights_only=True)
-        whisper_emb = cached['whisper'].unsqueeze(0)   # (1, T_w, 384) fp16
-        crepe_emb   = cached['crepe'].unsqueeze(0)     # (1, T_c, 256) fp16
-        chord_emb   = cached['chord'].unsqueeze(0)     # (1, T_ch, 240) fp16
-        beat_emb    = cached['beat'].unsqueeze(0)      # (1, T_b, 512) fp16
+        whisper_emb = cached['whisper'].detach().unsqueeze(0)   # (1, T_w, 384)
+        crepe_emb   = cached['crepe'].detach().unsqueeze(0)     # (1, T_c, 256)
+        chord_emb   = cached['chord'].detach().unsqueeze(0)     # (1, T_ch, 240)
+        beat_emb    = cached['beat'].detach().unsqueeze(0)      # (1, T_b, 512)
 
-        # Load audio for MERT (full mix)
+        # Load audio for MERT (full mix); kept on CPU so DataLoader workers can do this.
         v_path = self.pathext / idx_row['source'] / idx_row['filename'] / 'vocals.wav'
         a_path = self.pathext / idx_row['source'] / idx_row['filename'] / 'accompaniment.wav'
 
         v_audio, sr = torchaudio.load(v_path)
-        a_audio, sr = torchaudio.load(a_path)
+        a_audio, _  = torchaudio.load(a_path)
         if v_audio.shape[0] > 1:
             v_audio = v_audio.float().mean(dim=0, keepdim=True)
             a_audio = a_audio.float().mean(dim=0, keepdim=True)
 
         if self.sr and (sr != self.sr):
-            transform = torchaudio.transforms.Resample(sr, self.sr)
-            v_audio = transform(v_audio)
-            a_audio = transform(a_audio)
+            resampler = self._get_resampler(sr, self.sr)
+            v_audio = resampler(v_audio)
+            a_audio = resampler(a_audio)
             sr = self.sr
         duration = self.duration * sr
 
         if len(v_audio[0]) < duration or len(v_audio[0]) != len(a_audio[0]):
             return None
 
-        # Deterministic crop from start (matches caching)
+        # Deterministic crop from start (matches caching).
         v_clip = v_audio[:, :duration]
         a_clip = a_audio[:, :duration]
+        mix_clip = (v_clip + a_clip).squeeze(0).contiguous()  # (T,) fp32, leaf
 
-        # Full mix for MERT
-        mix_clip = v_clip + a_clip
-        mert_emb = self._mert_emb(mix_clip)
-
-        embeddings = (whisper_emb.detach().cpu(), crepe_emb.detach().cpu(),
-                      chord_emb.detach().cpu(), beat_emb.detach().cpu(),
-                      mert_emb.detach().cpu())
-        sample = {"emb": embeddings,
-                  "label": idx_row['source']}
+        sample = {
+            "emb": (whisper_emb, crepe_emb, chord_emb, beat_emb),
+            "mix": mix_clip,
+            "label": idx_row['source'],
+        }
         return sample
-
-    def _mert_emb(self, clip):
-        mert_inputs = self.mert_processor(clip.squeeze(0), sampling_rate=24000, return_tensors="pt")
-        mert_inputs = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in mert_inputs.items()}
-        with torch.no_grad():
-            mert_output = self.mert_model(**mert_inputs, output_hidden_states=True)
-        mert_all_layer_hidden_states = torch.stack(mert_output.hidden_states).squeeze()
-        return mert_all_layer_hidden_states
 
     def get_tracks(self, split):
         split_ratio = 0.9
@@ -168,27 +148,34 @@ def cached_collate(batch):
     embeddings = [item['emb'] for item in batch]
     labels = [item['label'] for item in batch]
 
-    whisper_batch = torch.stack([emb[0] for emb in embeddings])
-    crepe_batch = torch.stack([emb[1] for emb in embeddings])
-    chord_batch = torch.stack([emb[2] for emb in embeddings])
-    beat_this_batch = torch.stack([emb[3] for emb in embeddings])
-    mert_batch = torch.stack([emb[4] for emb in embeddings])
+    whisper_batch    = torch.stack([emb[0] for emb in embeddings])
+    crepe_batch      = torch.stack([emb[1] for emb in embeddings])
+    chord_batch      = torch.stack([emb[2] for emb in embeddings])
+    beat_this_batch  = torch.stack([emb[3] for emb in embeddings])
+    mix_batch        = torch.stack([item['mix'] for item in batch])  # (B, T) fp32
 
     return {
-        'emb': (whisper_batch, crepe_batch, chord_batch, beat_this_batch, mert_batch),
-        'label': labels
+        'emb': (whisper_batch, crepe_batch, chord_batch, beat_this_batch),
+        'mix': mix_batch,
+        'label': labels,
     }
 
 
 def get_cached_dataloader(split, data_configs, train_configs, shuffle=True):
     dataset = CachedDataset(data_configs, split)
 
-    dataloader = DataLoader(
-        dataset,
+    num_workers = int(train_configs.get('num_workers', 0))
+    pin_memory = bool(train_configs.get('pin_memory', False))
+
+    loader_kwargs = dict(
         batch_size=train_configs['batch_size'],
-        num_workers=0,  # must be 0: MERT runs on GPU inside __getitem__
-        pin_memory=train_configs['pin_memory'],
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         collate_fn=cached_collate,
-        shuffle=shuffle
+        shuffle=shuffle,
     )
-    return dataloader
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = int(train_configs.get('prefetch_factor', 4))
+
+    return DataLoader(dataset, **loader_kwargs)
