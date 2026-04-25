@@ -85,10 +85,10 @@ class CachedDataset():
 
         # Load cached features (float16 -> float32)
         cached = torch.load(self.cache_dir / f"{song_id}.pt", weights_only=True)
-        whisper_emb = cached['whisper'].float().unsqueeze(0)   # (1, T_w, 384)
-        crepe_emb = cached['crepe'].float().unsqueeze(0)       # (1, T_c, 256)
-        chord_emb = cached['chord'].float().unsqueeze(0)       # (1, T_ch, 240)
-        beat_emb = cached['beat'].float().unsqueeze(0)          # (1, T_b, 512)
+        whisper_emb = cached['whisper'].unsqueeze(0)   # (1, T_w, 384) fp16
+        crepe_emb   = cached['crepe'].unsqueeze(0)     # (1, T_c, 256) fp16
+        chord_emb   = cached['chord'].unsqueeze(0)     # (1, T_ch, 240) fp16
+        beat_emb    = cached['beat'].unsqueeze(0)      # (1, T_b, 512) fp16
 
         # Load audio for MERT (full mix)
         v_path = self.pathext / idx_row['source'] / idx_row['filename'] / 'vocals.wav'

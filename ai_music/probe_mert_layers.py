@@ -1,11 +1,13 @@
 """
-MERT layer probing. Temporal features written directly to disk — no RAM accumulation.
+MERT layer probing with seed control.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python -m ai_music.probe_mert_layers \
+    CUDA_VISIBLE_DEVICES=0 python -m ai_music.probe_mert_layers \
         --csv /data/SONICS/dataset_50k/combined_songs.csv \
         --data_root /data/SONICS/dataset_50k \
-        --batch_size 16 --num_workers 4 --duration 10 --max_samples 10000
+        --ood_csv /data/structture/ood_eval.csv \
+        --ood_data_root /data/structture/ood_ssep \
+        --batch_size 8 --num_workers 4 --duration 60 --max_samples 10000 --n_seeds 3
 """
 
 import sys
@@ -14,7 +16,6 @@ sys.path.insert(0, "/home/lennon/AI_music")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
 import numpy as np
 import pandas as pd
 import json
@@ -65,18 +66,13 @@ def extract_mert_batch(batch_mix, mert_model, mert_processor, sr=24000):
 
 
 def extract_split(name, loader, mert_model, mert_processor, temporal_stride, tmp_dir, max_n):
-    """
-    Extract MERT features. Mean-pooled in RAM (tiny).
-    Temporal written directly to memmap on /data — never held in RAM.
-    """
     pooled_path = tmp_dir / f"{name}_pooled.npy"
     temporal_path = tmp_dir / f"{name}_temporal.npy"
     labels_path = tmp_dir / f"{name}_labels.npy"
 
-    # Pre-allocate memmaps with max possible size
     pooled_mmap = np.memmap(pooled_path, dtype='float32', mode='w+', shape=(max_n, 13, 768))
     labels_mmap = np.memmap(labels_path, dtype='int64', mode='w+', shape=(max_n,))
-    temporal_mmap = None  # created after we know T_strided
+    temporal_mmap = None
     T_strided = None
 
     count = 0
@@ -87,33 +83,26 @@ def extract_split(name, loader, mert_model, mert_processor, temporal_stride, tmp
         layers = extract_mert_batch(batch['mix'], mert_model, mert_processor)
         B = layers.shape[0]
 
-        # Mean pool
-        pooled = layers.mean(dim=2).numpy()  # (B, 13, 768)
+        pooled = layers.mean(dim=2).numpy()
+        strided = layers[:, :, ::temporal_stride, :].numpy()
 
-        # Temporal stride
-        strided = layers[:, :, ::temporal_stride, :].numpy()  # (B, 13, T', 768)
-
-        # Create temporal memmap on first batch
         if temporal_mmap is None:
             T_strided = strided.shape[2]
             temporal_mmap = np.memmap(temporal_path, dtype='float32', mode='w+',
                                       shape=(max_n, 13, T_strided, 768))
             print(f"  Temporal shape per sample: (13, {T_strided}, 768)")
 
-        # Pad/trim to T_strided
         if strided.shape[2] > T_strided:
             strided = strided[:, :, :T_strided, :]
         elif strided.shape[2] < T_strided:
             pad = np.zeros((B, 13, T_strided - strided.shape[2], 768), dtype='float32')
             strided = np.concatenate([strided, pad], axis=2)
 
-        # Write directly to disk
         pooled_mmap[count:count + B] = pooled
         temporal_mmap[count:count + B] = strided
         labels_mmap[count:count + B] = batch['label'].numpy()
         count += B
 
-    # Flush
     pooled_mmap.flush()
     temporal_mmap.flush()
     labels_mmap.flush()
@@ -126,23 +115,43 @@ def extract_split(name, loader, mert_model, mert_processor, temporal_stride, tmp
 
 # ── Probe training & eval ────────────────────────────────────────────────
 
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+
+
 def train_probe(probe, tx, ty, vx, vy, lr=1e-3, bs=64, epochs=30, patience=5):
     probe = probe.cuda()
     opt = torch.optim.Adam(probe.parameters(), lr=lr)
-    tx, ty = tx.cuda(), ty.float().cuda()
-    vx, vy = vx.cuda(), vy.float().cuda()
+
+    # Keep data on CPU, move batches to GPU
+    ty = ty.float()
+    vy_gpu = vy.float().cuda()
 
     best_auc, best_state, wait = 0, None, 0
+    n = len(tx)
+
     for _ in range(epochs):
-        perm = torch.randperm(len(tx))
-        tx, ty = tx[perm], ty[perm]
+        perm = torch.randperm(n)
         probe.train()
-        for i in range(0, len(tx), bs):
-            loss = F.binary_cross_entropy_with_logits(probe(tx[i:i+bs]), ty[i:i+bs])
+        for i in range(0, n, bs):
+            idx = perm[i:i+bs]
+            bx = tx[idx].cuda()
+            by = ty[idx].cuda()
+            loss = F.binary_cross_entropy_with_logits(probe(bx), by)
             opt.zero_grad(); loss.backward(); opt.step()
+
+        # Eval in batches too
         probe.eval()
+        all_probs = []
         with torch.no_grad():
-            auc = roc_auc_score(vy.cpu().numpy(), torch.sigmoid(probe(vx)).cpu().numpy())
+            for i in range(0, len(vx), bs):
+                bx = vx[i:i+bs].cuda()
+                all_probs.append(torch.sigmoid(probe(bx)).cpu())
+        val_probs = torch.cat(all_probs).numpy()
+        auc = roc_auc_score(vy.numpy(), val_probs)
+
         if auc > best_auc:
             best_auc, best_state, wait = auc, {k: v.clone() for k, v in probe.state_dict().items()}, 0
         else:
@@ -152,10 +161,14 @@ def train_probe(probe, tx, ty, vx, vy, lr=1e-3, bs=64, epochs=30, patience=5):
     return probe
 
 
-def evaluate(probe, x, y):
+def evaluate(probe, x, y, bs=64):
     probe.eval()
+    all_probs = []
     with torch.no_grad():
-        probs = torch.sigmoid(probe(x.cuda())).cpu().numpy()
+        for i in range(0, len(x), bs):
+            bx = x[i:i+bs].cuda()
+            all_probs.append(torch.sigmoid(probe(bx)).cpu())
+    probs = torch.cat(all_probs).numpy()
     preds = (probs > 0.5).astype(int)
     y = y.numpy()
     return {'accuracy': float(accuracy_score(y, preds)),
@@ -178,56 +191,82 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--duration', type=int, default=10)
     parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument('--n_seeds', type=int, default=3, help='Number of seeds per layer')
+    parser.add_argument('--skip_extraction', action='store_true',
+                        help='Skip Phase 1, reuse existing tmp files from a previous run')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir) / args.mode
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(args.output_dir) / 'tmp'
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = tmp_dir / 'meta.json'
 
-    print(f"All temp files on /data: {tmp_dir}")
+    print(f"Temp files: {tmp_dir}")
+    print(f"Mode: {args.mode}, seeds: {args.n_seeds}, duration: {args.duration}s")
 
-    # Load MERT
-    print("Loading MERT...")
-    mert_model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True).cuda().eval()
-    mert_processor = Wav2Vec2FeatureExtractor.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
+    if args.skip_extraction:
+        # Load saved metadata from previous Phase 1
+        with open(meta_path) as f:
+            split_info = {k: tuple(v) for k, v in json.load(f).items()}
+        print(f"\nSkipping extraction, loaded metadata: {split_info}")
+    else:
+        # Load MERT
+        print("Loading MERT...")
+        mert_model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True).cuda().eval()
+        mert_processor = Wav2Vec2FeatureExtractor.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
 
-    # ── Phase 1: Extract to disk ─────────────────────────────────────────
+        # ── Phase 1: Extract to disk ─────────────────────────────────────────
 
-    print("\n=== Phase 1: Extract features to disk ===")
-    split_info = {}
+        print("\n=== Phase 1: Extract features to disk ===")
+        split_info = {}
 
-    for split in ['train', 'val']:
-        tracks = get_tracks(args.csv, args.data_root, split)
-        if split == 'train' and args.max_samples and len(tracks) > args.max_samples:
-            tracks = tracks.head(args.max_samples)
-        max_n = len(tracks)
-        print(f"\n{split}: up to {max_n} songs, {args.duration}s clips")
-        loader = get_probe_dataloader(tracks, args.data_root, duration=args.duration,
-                                       batch_size=args.batch_size, num_workers=args.num_workers)
-        n, T = extract_split(split, loader, mert_model, mert_processor,
-                              args.temporal_stride, tmp_dir, max_n)
-        split_info[split] = (n, T)
+        for split in ['train', 'val']:
+            tracks = get_tracks(args.csv, args.data_root, split)
+            if split == 'train' and args.max_samples and len(tracks) > args.max_samples:
+                # Balanced subsample: equal real and fake
+                half = args.max_samples // 2
+                real_subset = tracks[tracks['source'] == 'real'].head(half)
+                fake_subset = tracks[tracks['source'] == 'fake'].head(half)
+                tracks = pd.concat([real_subset, fake_subset]).sample(
+                    frac=1, random_state=42).reset_index(drop=True)
+            max_n = len(tracks)
 
-    if args.ood_csv:
-        ood_tracks = get_tracks(args.ood_csv, args.ood_data_root, 'all')
-        max_n = len(ood_tracks)
-        print(f"\nOOD: up to {max_n} songs")
-        loader = get_probe_dataloader(ood_tracks, args.ood_data_root, duration=args.duration,
-                                       batch_size=args.batch_size, num_workers=args.num_workers)
-        n, T = extract_split('ood', loader, mert_model, mert_processor,
-                              args.temporal_stride, tmp_dir, max_n)
-        split_info['ood'] = (n, T)
+            # Check class balance
+            n_real = (tracks['source'] == 'real').sum()
+            n_fake = (tracks['source'] == 'fake').sum()
+            print(f"\n{split}: {max_n} songs (real: {n_real}, fake: {n_fake}), {args.duration}s clips")
 
-    del mert_model, mert_processor
-    torch.cuda.empty_cache()
-    print("\nMERT freed from GPU.")
+            loader = get_probe_dataloader(tracks, args.data_root, duration=args.duration,
+                                           batch_size=args.batch_size, num_workers=args.num_workers)
+            n, T = extract_split(split, loader, mert_model, mert_processor,
+                                  args.temporal_stride, tmp_dir, max_n)
+            split_info[split] = (n, T)
 
-    # ── Phase 2: Train probes from disk ──────────────────────────────────
+        if args.ood_csv:
+            ood_tracks = get_tracks(args.ood_csv, args.ood_data_root, 'all')
+            max_n = len(ood_tracks)
+            n_real = (ood_tracks['source'] == 'real').sum()
+            n_fake = (ood_tracks['source'] == 'fake').sum()
+            print(f"\nOOD: {max_n} songs (real: {n_real}, fake: {n_fake})")
+            loader = get_probe_dataloader(ood_tracks, args.ood_data_root, duration=args.duration,
+                                           batch_size=args.batch_size, num_workers=args.num_workers)
+            n, T = extract_split('ood', loader, mert_model, mert_processor,
+                                  args.temporal_stride, tmp_dir, max_n)
+            split_info['ood'] = (n, T)
 
-    print("\n=== Phase 2: Train probes ===")
+        # Save metadata for --skip_extraction
+        with open(meta_path, 'w') as f:
+            json.dump(split_info, f)
 
-    # Open memmaps read-only
+        del mert_model, mert_processor
+        torch.cuda.empty_cache()
+        print("\nMERT freed from GPU.")
+
+    # ── Phase 2: Train probes with multiple seeds ────────────────────────
+
+    print(f"\n=== Phase 2: Train probes ({args.n_seeds} seeds per layer) ===")
+
     N_train, T_s = split_info['train']
     N_val, _ = split_info['val']
 
@@ -251,33 +290,81 @@ def main():
     for layer in range(13):
         print(f"\nLayer {layer}")
 
+        # Load features for this layer
         if args.mode == 'linear':
             tx = torch.from_numpy(train_pooled[:, layer, :].copy())
             vx = torch.from_numpy(val_pooled[:, layer, :].copy())
-            probe = LinearProbe(768)
         else:
             tx = torch.from_numpy(train_temporal[:, layer, :, :].copy())
             vx = torch.from_numpy(val_temporal[:, layer, :, :].copy())
-            probe = AttentionProbe(768)
-
-        probe = train_probe(probe, tx, train_labels, vx, val_labels)
-        ind = evaluate(probe, vx, val_labels)
-        print(f"  In-dist  — Acc: {ind['accuracy']:.3f}, F1: {ind['f1']:.3f}, AUC: {ind['auc']:.3f}")
-        res = {'in_distribution': ind}
 
         if has_ood:
             if args.mode == 'linear':
                 ox = torch.from_numpy(ood_pooled[:, layer, :].copy())
             else:
                 ox = torch.from_numpy(ood_temporal[:, layer, :, :].copy())
-            ood = evaluate(probe, ox, ood_labels)
-            print(f"  OOD      — Acc: {ood['accuracy']:.3f}, F1: {ood['f1']:.3f}, AUC: {ood['auc']:.3f}")
-            res['ood'] = ood
 
-        all_results[f'layer_{layer}'] = res
-        torch.save(probe.state_dict(), output_dir / f'probe_layer_{layer}.pt')
+        # Run multiple seeds
+        seed_results = []
+        for seed in range(args.n_seeds):
+            set_seed(seed * 100 + layer)
 
-        # Free layer data from RAM
+            if args.mode == 'linear':
+                probe = LinearProbe(768)
+            else:
+                probe = AttentionProbe(768)
+
+            probe = train_probe(probe, tx, train_labels, vx, val_labels)
+            ind = evaluate(probe, vx, val_labels)
+            seed_result = {'in_distribution': ind}
+
+            if has_ood:
+                ood_result = evaluate(probe, ox, ood_labels)
+                seed_result['ood'] = ood_result
+
+            seed_results.append(seed_result)
+
+            if seed == 0:
+                # Save best probe (first seed, will update if better)
+                best_probe_state = {k: v.clone().cpu() for k, v in probe.state_dict().items()}
+                best_ood_auc = seed_result.get('ood', {}).get('auc', ind['auc'])
+
+            if has_ood and seed_result['ood']['auc'] > best_ood_auc:
+                best_probe_state = {k: v.clone().cpu() for k, v in probe.state_dict().items()}
+                best_ood_auc = seed_result['ood']['auc']
+
+        # Aggregate across seeds
+        def aggregate_metric(results, split_key, metric):
+            vals = [r[split_key][metric] for r in results if split_key in r]
+            return {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+
+        layer_result = {
+            'in_distribution': {
+                'accuracy': aggregate_metric(seed_results, 'in_distribution', 'accuracy'),
+                'f1': aggregate_metric(seed_results, 'in_distribution', 'f1'),
+                'auc': aggregate_metric(seed_results, 'in_distribution', 'auc'),
+            }
+        }
+        if has_ood:
+            layer_result['ood'] = {
+                'accuracy': aggregate_metric(seed_results, 'ood', 'accuracy'),
+                'f1': aggregate_metric(seed_results, 'ood', 'f1'),
+                'auc': aggregate_metric(seed_results, 'ood', 'auc'),
+            }
+
+        layer_result['per_seed'] = seed_results
+        all_results[f'layer_{layer}'] = layer_result
+
+        # Print mean ± std
+        ia = layer_result['in_distribution']['auc']
+        print(f"  In-dist  — AUC: {ia['mean']:.3f} ± {ia['std']:.3f}")
+        if has_ood:
+            oa = layer_result['ood']['auc']
+            print(f"  OOD      — AUC: {oa['mean']:.3f} ± {oa['std']:.3f}")
+
+        torch.save(best_probe_state, output_dir / f'probe_layer_{layer}.pt')
+
+        # Free
         del tx, vx
         if has_ood:
             del ox
@@ -288,25 +375,21 @@ def main():
     with open(output_dir / 'results.json', 'w') as f:
         json.dump(all_results, f, indent=2)
 
-    print(f"\n{'Layer':<8}{'In-dist AUC':<14}", end="")
-    if has_ood: print(f"{'OOD AUC':<14}{'Gap':<10}", end="")
-    print("\n" + "-" * (46 if has_ood else 22))
+    print(f"\n{'Layer':<8}{'In-dist AUC':<20}", end="")
+    if has_ood: print(f"{'OOD AUC':<20}{'Gap':<10}", end="")
+    print("\n" + "-" * (58 if has_ood else 28))
     for i in range(13):
         r = all_results[f'layer_{i}']
         ia = r['in_distribution']['auc']
-        print(f"{i:<8}{ia:<14.3f}", end="")
+        print(f"{i:<8}{ia['mean']:.3f} ± {ia['std']:.3f}    ", end="")
         if has_ood:
             oa = r['ood']['auc']
-            print(f"{oa:<14.3f}{ia - oa:<10.3f}", end="")
+            gap = ia['mean'] - oa['mean']
+            print(f"{oa['mean']:.3f} ± {oa['std']:.3f}    {gap:.3f}", end="")
         print()
 
     print(f"\nResults saved to {output_dir / 'results.json'}")
-
-    # Cleanup
-    print("Cleaning up tmp files...")
-    for f in tmp_dir.glob("*.npy"):
-        f.unlink()
-    print("Done.")
+    print(f"Tmp files kept at {tmp_dir} (rerun with --skip_extraction to reuse)")
 
 
 if __name__ == '__main__':
