@@ -85,16 +85,6 @@ class LightningModel(L.LightningModule):
             out = self.mert(input_values=mix, output_hidden_states=True)
         return torch.stack(out.hidden_states, dim=1)
 
-    def _resolve_mert_layers(self, batch):
-        """Backward compatible: training uses batch['mix'] (raw audio),
-        infer.py still passes pre-computed MERT as batch['emb'][4]."""
-        if "mix" in batch and batch["mix"] is not None:
-            return self._run_mert(batch["mix"])
-        emb = batch["emb"]
-        if len(emb) >= 5:
-            return emb[4]
-        raise ValueError("Batch must contain raw 'mix' audio or pre-computed MERT in emb[4].")
-
     def _apply_ablation(self, attention_features):
         """Zero out ablated modalities."""
         for name in self.ablate_modalities:
@@ -104,7 +94,7 @@ class LightningModel(L.LightningModule):
 
     def _step(self, batch, log_prefix):
         feats = [emb.squeeze(1) for emb in batch["emb"][:4]]
-        mert_layers = self._resolve_mert_layers(batch)
+        mert_layers = self._run_mert(batch["mix"])
 
         attention_features = self.fuser.forward(feats=feats, mert_layers=mert_layers)
         attention_features = self._apply_ablation(attention_features)
@@ -129,6 +119,11 @@ class LightningModel(L.LightningModule):
     def training_step(self, batch):
         if batch is None:
             return None
+        # BatchNorm1d (in the ResNet classifier head) can't compute variance over
+        # a single sample. If the collate fn filtered enough Nones to leave <2
+        # samples, skip this step rather than crashing.
+        if len(batch.get('label', [])) < 2:
+            return None
         return self._step(batch, "train")
 
     def validation_step(self, batch):
@@ -141,7 +136,7 @@ class LightningModel(L.LightningModule):
             return None
 
         feats = [emb.squeeze(1) for emb in batch["emb"][:4]]
-        mert_layers = self._resolve_mert_layers(batch)
+        mert_layers = self._run_mert(batch["mix"])
 
         attention_features = self.fuser.forward(feats=feats, mert_layers=mert_layers)
         attention_features = self._apply_ablation(attention_features)
@@ -165,9 +160,9 @@ class LightningModel(L.LightningModule):
         optimizer = torch.optim.Adam(trainable, lr=lr, weight_decay=wd)
         return optimizer
 
-    # --- checkpoint compatibility: exclude MERT from state_dict so old
-    # checkpoints (which never had mert.* keys) still load, and new
-    # checkpoints stay small. MERT is reconstructed from pretrained on init.
+    # MERT is frozen and identical across runs (loaded from pretrained), so we
+    # exclude its weights from saved checkpoints to keep them small, and inject
+    # them from the pretrained init when loading.
     def state_dict(self, *args, **kwargs):
         sd = super().state_dict(*args, **kwargs)
         return {k: v for k, v in sd.items() if not k.startswith('mert.')}

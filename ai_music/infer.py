@@ -20,8 +20,6 @@ sys.path.insert(0, str("/home/lennon/AI_music/beat_this"))
 sys.path.insert(0, "/home/lennon/AI_music")
 from beat_this.inference import load_model, LogMelSpect
 from feature_extractor import FeatureExtractor
-from transformers import Wav2Vec2FeatureExtractor
-from transformers import AutoModel
 import torchcrepe
 import whisper
 import warnings
@@ -49,8 +47,13 @@ class InferenceDataset(Dataset):
         self.duration = data_configs["duration"]
         self.whisper_size = data_configs["whisper_size"]
         self.crepe_size = data_configs["crepe_size"]
-        
-        # Initialize models
+        if self.sr != 24000:
+            raise ValueError(
+                f"data.sample_rate must be 24000 (MERT input rate); got {self.sr}"
+            )
+
+        # MERT is run inside LightningModel on the mixed audio at 24kHz.
+        # All other branches resample per-modality below to match precompute_features.py.
         self.whisper = whisper.load_model(self.whisper_size, device='cuda')
         self.chordnet = FeatureExtractor()
         self.beat_this = load_model('/home/lennon/AI_music/beat_this/final0.ckpt', device='cuda')
@@ -61,128 +64,121 @@ class InferenceDataset(Dataset):
             n_mels=128,
             device='cuda'
         )
-        self.mert_model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
-        self.mert_model = self.mert_model.to('cuda')
-        self.mert_processor = Wav2Vec2FeatureExtractor.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
-        
-        # Load audio
+
+        # Load + mono + resample to 24kHz (the master rate, matches precompute).
         v_audio, sr = torchaudio.load(self.vocals_path)
-        a_audio, sr = torchaudio.load(self.accompaniment_path)
-        
+        a_audio, _ = torchaudio.load(self.accompaniment_path)
+
         if v_audio.shape[0] > 1:
             v_audio = v_audio.float().mean(dim=0, keepdim=True)
         if a_audio.shape[0] > 1:
             a_audio = a_audio.float().mean(dim=0, keepdim=True)
-        
-        if self.sr and (sr != self.sr):
+
+        if sr != self.sr:
             transform = torchaudio.transforms.Resample(sr, self.sr)
             v_audio = transform(v_audio)
             a_audio = transform(a_audio)
-        
-        # Extract first clip (duration seconds) or pad if shorter
+
+        # Crop or pad to duration at 24kHz.
         self.duration_samples = int(self.duration * self.sr)
-        audio_length = min(len(v_audio[0]), len(a_audio[0]))
-        
-        # Take first clip of specified duration
+        audio_length = min(v_audio.shape[1], a_audio.shape[1])
         v_clip = v_audio[:, :min(self.duration_samples, audio_length)]
         a_clip = a_audio[:, :min(self.duration_samples, audio_length)]
-        
-        # Pad if shorter than duration
         if v_clip.shape[1] < self.duration_samples:
             padding = self.duration_samples - v_clip.shape[1]
             v_clip = torch.nn.functional.pad(v_clip, (0, padding))
             a_clip = torch.nn.functional.pad(a_clip, (0, padding))
-        
-        self.v_clip = v_clip
-        self.a_clip = a_clip
+
+        # Per-modality views, each at the rate that branch was trained on.
+        # Whisper / Crepe expect 16kHz vocal; Chord-Net / Beat-This expect 22.05kHz accomp.
+        # MERT consumes (v + a) at 24kHz inside LightningModel.
+        v_mono_24k = v_clip.squeeze(0)
+        a_mono_24k = a_clip.squeeze(0)
+        self.v_clip_24k = v_clip  # (1, T_24)
+        self.a_clip_24k = a_clip  # (1, T_24)
+        self.v_clip_16k = torchaudio.transforms.Resample(self.sr, 16000)(v_mono_24k).contiguous()  # (T_16,)
+        self.a_clip_22k = torchaudio.transforms.Resample(self.sr, 22050)(a_mono_24k).contiguous()  # (T_22,)
     
     def __len__(self):
         return 1  # Always return one clip
     
     def __getitem__(self, idx):
-        # Extract embeddings from the single clip
-        whisper_emb = self._lyrics_emb(self.v_clip)
-        crepe_emb = self._pitch_emb(self.v_clip)
-        chord_emb = self._chord_emb(self.a_clip)
-        beat_emb = self._beat_emb(self.a_clip)
-        mert_emb = self._mert_emb(self.a_clip)
-        
-        # Move embeddings to CPU for dataloader
-        embeddings = (whisper_emb.detach().cpu(), crepe_emb.detach().cpu(), chord_emb.detach().cpu(), 
-                      beat_emb.detach().cpu(), mert_emb.detach().cpu())
-        
-        return {"emb": embeddings}
-    
-    def _pitch_emb(self, clip):
+        whisper_emb = self._lyrics_emb(self.v_clip_16k)
+        crepe_emb = self._pitch_emb(self.v_clip_16k)
+        chord_emb = self._chord_emb(self.a_clip_22k)
+        beat_emb = self._beat_emb(self.a_clip_22k)
+
+        embeddings = (
+            whisper_emb.detach().cpu(),
+            crepe_emb.detach().cpu(),
+            chord_emb.detach().cpu(),
+            beat_emb.detach().cpu(),
+        )
+
+        # Mix is what LightningModel feeds to MERT; matches cached_dataset.py format.
+        mix_clip = (self.v_clip_24k + self.a_clip_24k).squeeze(0).contiguous()
+
+        return {"emb": embeddings, "mix": mix_clip}
+
+    def _lyrics_emb(self, clip_16k):
+        """clip_16k: (T,) at 16kHz. Whisper expects 30s chunks at 16kHz."""
+        whisper_embs = []
+        chunk_len = 16000 * 30
+        for i in range(0, clip_16k.shape[0], chunk_len):
+            chunk = clip_16k[i:i + chunk_len]
+            if chunk.shape[0] < chunk_len:
+                break
+            mel = whisper.log_mel_spectrogram(chunk)
+            with torch.no_grad():
+                whisper_embs.append(self.whisper.encoder(mel.unsqueeze(0).to('cuda')))
+        if not whisper_embs:
+            raise ValueError(
+                f"clip_16k length {clip_16k.shape[0]} < {chunk_len} samples (30s @ 16kHz); "
+                "increase data.duration to at least 30."
+            )
+        return torch.cat(whisper_embs, dim=1)  # (1, T_w, 384)
+
+    def _pitch_emb(self, clip_16k):
+        """clip_16k: (T,) at 16kHz."""
         crepe = torchcrepe.embed(
-            clip, self.sr,
-            hop_length=int(self.sr/100),
+            clip_16k.unsqueeze(0), 16000,
+            hop_length=int(16000 / 100),
             model="tiny",
             batch_size=512,
             device='cuda',
-            pad=True
+            pad=True,
         ).flatten(start_dim=2)
-        return crepe[:, 1:, :]
+        return crepe[:, 1:, :]  # (1, T_c, 256)
 
-    def _lyrics_emb(self, clip):
-        whisper_embs = []
-        for chunk in self._audio_chunks(clip, self.sr*30):
-            mel = whisper.log_mel_spectrogram(chunk.squeeze(0))
-            with torch.no_grad():
-                result = self.whisper.encoder(mel.unsqueeze(0).to('cuda'))
-                whisper_embs.append(result)
-        return torch.cat(whisper_embs, dim=1)
+    def _chord_emb(self, clip_22k):
+        """clip_22k: (T,) at 22.05kHz (Chord-Net's expected rate)."""
+        arr = clip_22k.cpu().numpy()
+        chord = self.chordnet.extract_features_from_audio(arr, 22050)
+        return torch.from_numpy(chord.astype(np.float32, copy=False)).unsqueeze(0)
 
-    def _chord_emb(self, clip):
-        chordnet = self.chordnet.extract_features_from_audio(clip.squeeze(0), self.sr)
-        return torch.from_numpy(chordnet.astype(np.float32, copy=False)).unsqueeze(0)
-    
-    def _beat_emb(self, clip):
-        if self.sr != 22050:
-            resampler = torchaudio.transforms.Resample(self.sr, 22050)
-            clip = resampler(clip)
-
-        mono = clip.to('cuda')
-        if mono.ndim == 2:
-            mono = mono.mean(dim=0) if mono.shape[0] > 1 else mono.squeeze(0)
-        elif mono.ndim != 1:
-            raise ValueError(f"Expected 1D or 2D audio, got shape {tuple(mono.shape)}")
-
+    def _beat_emb(self, clip_22k):
+        """clip_22k: (T,) at 22.05kHz."""
+        mono = clip_22k.to('cuda')
         spect = self.bt_spec_extractor(mono).unsqueeze(0)
         with torch.inference_mode():
-            model_output = self.beat_this(spect)
-            beat_embedding = model_output["feat"]
-        return beat_embedding
-    
-    def _mert_emb(self, clip):
-        mert_inputs = self.mert_processor(clip.squeeze(0), sampling_rate=24000, return_tensors="pt")
-        mert_inputs = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in mert_inputs.items()}
-        with torch.no_grad():
-            mert_output = self.mert_model(**mert_inputs, output_hidden_states=True)
-        mert_all_layer_hidden_states = torch.stack(mert_output.hidden_states).squeeze()
-        return mert_all_layer_hidden_states
-    
-    def _audio_chunks(self, clip, chunk_length):
-        n_samples = clip.shape[1]
-        n_chunks = n_samples // chunk_length
-        trimmed = clip[:, :n_chunks * chunk_length]
-        chunks = torch.split(trimmed, chunk_length, dim=1)
-        return chunks
+            return self.beat_this(spect)["feat"]  # (1, T_b, 512)
 
 
 def collate_fn(batch):
-    """Collate function for inference."""
+    """Collate function for inference. Mirrors cached_dataset.cached_collate:
+    pre-computed features in 'emb' (4-tuple), raw mix audio in 'mix'.
+    LightningModel runs MERT on 'mix' inside the forward pass."""
     embeddings = [item['emb'] for item in batch]
-    
-    # Stack each embedding type across the batch
+
     whisper_batch = torch.stack([emb[0] for emb in embeddings])
     crepe_batch = torch.stack([emb[1] for emb in embeddings])
     chord_batch = torch.stack([emb[2] for emb in embeddings])
     beat_this_batch = torch.stack([emb[3] for emb in embeddings])
-    mert_batch = torch.stack([emb[4] for emb in embeddings])
-    
+    mix_batch = torch.stack([item['mix'] for item in batch])
+
     return {
-        'emb': (whisper_batch, crepe_batch, chord_batch, beat_this_batch, mert_batch),
+        'emb': (whisper_batch, crepe_batch, chord_batch, beat_this_batch),
+        'mix': mix_batch,
     }
 
 
@@ -298,6 +294,9 @@ def main():
     parser.add_argument('--config', type=str, default='/home/lennon/AI_music/ai_music/configs/SpecTTTra.yaml',
                         help='Path to config file')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
+    parser.add_argument('--fusion', type=str, default='cross_attention',
+                        choices=['cross_attention', 'concat'],
+                        help='Fusion architecture used during training. Must match the trained checkpoint.')
     parser.add_argument('--csv_out', type=str, default=None,
                         help='Optional path to write inference summary CSV')
     
@@ -347,10 +346,17 @@ def main():
     else:
         raise ValueError(f"Unknown classifier_type: {classifier_type}. Must be 'ResNet' or 'SpecTTTra'")
 
+    if args.fusion == 'cross_attention':
+        fuser = cross_attention.MultiModalMERTFusion(use_layer_mix=True)
+    elif args.fusion == 'concat':
+        fuser = cross_attention.ConcatLinearFusion()
+    else:
+        raise ValueError(f"Unknown fusion: {args.fusion}. Must be 'cross_attention' or 'concat'")
+
     model = LightningModel.load_from_checkpoint(
         args.checkpoint,
         classifier=classifier,
-        fuser=cross_attention.MultiModalMERTFusion(use_layer_mix=True),
+        fuser=fuser,
         configs=train_config,
         map_location='cpu'  # Load to CPU first, then move to GPU if available
     )

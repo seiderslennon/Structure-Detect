@@ -167,12 +167,16 @@ def get_cached_dataloader(split, data_configs, train_configs, shuffle=True):
     num_workers = int(train_configs.get('num_workers', 0))
     pin_memory = bool(train_configs.get('pin_memory', False))
 
+    # Drop the last partial batch only on the training loader so BatchNorm
+    # never sees a batch of size 1 (the ResNet classifier head uses BatchNorm1d).
+    # Validation runs in eval mode (running stats), so a batch of 1 is harmless there.
     loader_kwargs = dict(
         batch_size=train_configs['batch_size'],
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=cached_collate,
         shuffle=shuffle,
+        drop_last=shuffle,
     )
     if num_workers > 0:
         loader_kwargs['persistent_workers'] = True
