@@ -78,24 +78,89 @@ def _normalize_test_predictions_format(df: pd.DataFrame, threshold: float) -> pd
     return out
 
 
-def build_eval_frame(df: pd.DataFrame, fake_threshold: float = 0.5) -> pd.DataFrame:
+def _apply_threshold(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Re-derive ``prediction_label`` / ``prediction`` from ``fake_prob`` using
+    the supplied decision threshold. Useful for transferring a threshold tuned
+    on a test set onto an OOD set without re-running inference.
+    """
+    out = df.copy()
+    fake_prob = out["fake_prob"].astype(float)
+    is_fake_pred = fake_prob > threshold
+    out["prediction_label"] = np.where(is_fake_pred, "fake", "real")
+    out["prediction"] = (~is_fake_pred).astype(int)  # 1 = real, 0 = fake
+    if "real_prob" not in out.columns:
+        out["real_prob"] = 1.0 - fake_prob
+    return out
+
+
+def _normalize_song_id_format(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize predict_cached.py / predict_evalset.py schema
+    (song_id, label, prediction, prediction_label, real_prob, fake_prob) into the
+    evalset schema. ``label`` is preserved as a hint so build_eval_frame can use
+    it directly instead of re-inferring from filename prefixes.
+    """
+    out = pd.DataFrame()
+    out["song_dir"] = df["song_id"].astype(str)
+    out["prediction_label"] = df["prediction_label"].astype(str)
+    out["real_prob"] = df["real_prob"].astype(float)
+    out["fake_prob"] = df["fake_prob"].astype(float)
+    if "prediction" in df.columns:
+        out["prediction"] = df["prediction"].astype(int)
+    else:
+        out["prediction"] = (df["prediction_label"].astype(str).str.lower() == "real").astype(int)
+    if "label" in df.columns:
+        out["label"] = df["label"].astype(str).str.lower()
+    return out
+
+
+def build_eval_frame(
+    df: pd.DataFrame,
+    fake_threshold: float = 0.5,
+    override_threshold: bool = False,
+) -> pd.DataFrame:
+    """Normalize ``df`` to the eval schema and attach ground-truth columns.
+
+    ``fake_threshold`` is always used when the input is in the
+    ``test_predictions`` schema (which only carries probabilities). For the
+    other schemas the threshold is only applied when ``override_threshold`` is
+    True, in which case ``prediction_label`` / ``prediction`` are re-derived
+    from ``fake_prob``. This lets you take a threshold tuned on a test set and
+    apply it to an OOD CSV without re-running inference.
+    """
     evalset_cols = {"song_dir", "prediction", "prediction_label", "real_prob", "fake_prob"}
+    song_id_cols = {"song_id", "prediction_label", "real_prob", "fake_prob"}
     test_pred_cols = {"filepath", "y_true", "y_pred"}
 
     if evalset_cols.issubset(df.columns):
         normalized = df.copy()
+        if override_threshold:
+            normalized = _apply_threshold(normalized, fake_threshold)
+    elif song_id_cols.issubset(df.columns):
+        normalized = _normalize_song_id_format(df)
+        if override_threshold:
+            normalized = _apply_threshold(normalized, fake_threshold)
     elif test_pred_cols.issubset(df.columns):
         normalized = _normalize_test_predictions_format(df, threshold=fake_threshold)
     else:
         missing = sorted(evalset_cols - set(df.columns))
         raise ValueError(
             f"Unrecognized CSV schema. Missing evalset columns: {missing}. "
-            f"Expected either {sorted(evalset_cols)} or {sorted(test_pred_cols)}."
+            f"Expected one of {sorted(evalset_cols)}, {sorted(song_id_cols)}, "
+            f"or {sorted(test_pred_cols)}."
         )
 
     out = normalized.copy()
     out["source_model"] = out["song_dir"].apply(infer_source_model)
-    out["y_true_fake"] = (out["source_model"] != "real").astype(int)
+    # Prefer an explicit ground-truth label column if present (predict_evalset.py
+    # carries one). Otherwise fall back to the filename-prefix heuristic.
+    if "label" in out.columns:
+        labels_lower = out["label"].astype(str).str.lower()
+        out["y_true_fake"] = labels_lower.eq("fake").astype(int)
+        # Re-tag rows that have an explicit 'real' label but whose filename happens
+        # to look like a generator prefix (and vice-versa).
+        out.loc[labels_lower.eq("real"), "source_model"] = "real"
+    else:
+        out["y_true_fake"] = (out["source_model"] != "real").astype(int)
     out["y_pred_fake"] = out["prediction_label"].astype(str).str.lower().eq("fake").astype(int)
     return out
 
@@ -142,10 +207,14 @@ def _print_table(df: pd.DataFrame) -> None:
 
 
 def _load_and_build(
-    csv_path: str, fake_threshold: float
+    csv_path: str, fake_threshold: float, override_threshold: bool = False
 ) -> pd.DataFrame:
     raw = pd.read_csv(csv_path)
-    return build_eval_frame(raw, fake_threshold=fake_threshold)
+    return build_eval_frame(
+        raw,
+        fake_threshold=fake_threshold,
+        override_threshold=override_threshold,
+    )
 
 
 def _intersect_song_dirs(eval_dfs: List[pd.DataFrame]) -> List[pd.DataFrame]:
@@ -228,14 +297,19 @@ def main() -> None:
     parser.add_argument(
         "--fake-threshold",
         type=float,
-        default=0.5,
+        default=None,
         help=(
-            "Decision threshold on y_pred (fake probability) used when the input CSV "
-            "is in test_predictions format (columns: filepath,target,y_true,y_pred). "
-            "Ignored for CSVs that already contain prediction_label."
+            "Decision threshold on fake_prob. When provided, predictions are "
+            "re-derived from fake_prob for ALL CSV formats (use this to take a "
+            "threshold tuned on a test set and apply it to an OOD set). "
+            "If omitted, CSVs that already contain prediction_label are used as-is, "
+            "and test_predictions-format CSVs default to 0.5."
         ),
     )
     args = parser.parse_args()
+
+    override_threshold = args.fake_threshold is not None
+    fake_threshold = args.fake_threshold if override_threshold else 0.5
 
     csv_paths: List[str] = list(args.csv)
     if args.labels:
@@ -248,8 +322,16 @@ def main() -> None:
         labels = [Path(p).stem for p in csv_paths]
 
     eval_dfs = [
-        _load_and_build(p, fake_threshold=args.fake_threshold) for p in csv_paths
+        _load_and_build(
+            p,
+            fake_threshold=fake_threshold,
+            override_threshold=override_threshold,
+        )
+        for p in csv_paths
     ]
+
+    if override_threshold:
+        print(f"\n[threshold] Re-thresholding all predictions at fake_prob > {fake_threshold:.4f}")
 
     if len(eval_dfs) > 1 and args.intersect:
         eval_dfs = _intersect_song_dirs(eval_dfs)

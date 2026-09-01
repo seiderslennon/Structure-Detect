@@ -295,7 +295,7 @@ def main():
                         help='Path to config file')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
     parser.add_argument('--fusion', type=str, default='cross_attention',
-                        choices=['cross_attention', 'concat'],
+                        choices=['cross_attention', 'concat', 'mert_only'],
                         help='Fusion architecture used during training. Must match the trained checkpoint.')
     parser.add_argument('--csv_out', type=str, default=None,
                         help='Optional path to write inference summary CSV')
@@ -350,8 +350,12 @@ def main():
         fuser = cross_attention.MultiModalMERTFusion(use_layer_mix=True)
     elif args.fusion == 'concat':
         fuser = cross_attention.ConcatLinearFusion()
+    elif args.fusion == 'mert_only':
+        fuser = cross_attention.MERTOnlyFusion()
     else:
-        raise ValueError(f"Unknown fusion: {args.fusion}. Must be 'cross_attention' or 'concat'")
+        raise ValueError(
+            f"Unknown fusion: {args.fusion}. Must be 'cross_attention', 'concat', or 'mert_only'"
+        )
 
     model = LightningModel.load_from_checkpoint(
         args.checkpoint,

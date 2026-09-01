@@ -263,3 +263,49 @@ class ConcatLinearFusion(nn.Module):
             out.append(proj(combined))  # [B, Tq, out_dim]
 
         return out
+
+
+class MERTOnlyFusion(nn.Module):
+    """
+    MERT-only baseline. Ignores the per-modality features entirely; the
+    classifier sees a single MERT-derived sequence (replicated 4x to satisfy
+    the existing classifier interface that expects one tensor per modality).
+
+    Pipeline: ScalarMix(13 MERT layers) -> LayerNorm -> Linear -> GELU -> Linear
+    -> [B, Tm, out_dim]. The same tensor is returned in all four modality
+    slots, so:
+      - SpecTTTraAttentionClassifier averages 4 identical pooled outputs
+        (= the single MERT-pooled output; just 4x compute on the head).
+      - ResNet treats each as one input channel; channels are identical.
+
+    This is the fuser to use when you want a real "MERT only" baseline.
+    Don't combine this with --ablate; the --ablate flag still zeros the
+    matching post-fusion slot, so e.g. --ablate whisper here would zero one
+    of the four MERT copies, attenuating but not eliminating the signal.
+    """
+    def __init__(self, out_dim=512, mert_dim=768, mert_layers=13):
+        super().__init__()
+        self.out_dim = out_dim
+        self.mixer = ScalarMix(mert_layers)
+        # Same projection shape as ConcatLinearFusion's per-modality stacks
+        # for shape-comparable capacity, but with no specialty-feature concat.
+        self.proj = nn.Sequential(
+            nn.LayerNorm(mert_dim),
+            nn.Linear(mert_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, feats, mert_layers, masks=None, mert_mask=None):
+        """
+        feats / masks / mert_mask: ignored (kept for interface parity).
+        mert_layers: [B, 13, Tm, 768] or list of 13 [B, Tm, 768] tensors.
+        Returns: list of 4 references to the same [B, Tm, out_dim] tensor,
+        so downstream classifiers (SpecTTTra, ResNet) consume the standard
+        4-modality input format.
+        """
+        mert_mixed = self.mixer(mert_layers)        # [B, Tm, 768]
+        projected = self.proj(mert_mixed)           # [B, Tm, out_dim]
+        # Same tensor reference 4x — autograd treats this correctly (gradients
+        # accumulate across the four uses) and we avoid 4x memory duplication.
+        return [projected, projected, projected, projected]

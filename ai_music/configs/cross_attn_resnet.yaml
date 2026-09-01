@@ -1,5 +1,6 @@
 data:
   data_root: '/data/SONICS/dataset_50k/combined_songs.csv'
+  mix_root: '/data/SONICS/sonics'
   sample_rate: 24000
   duration: 60
   random_sample: True
@@ -14,7 +15,7 @@ train:
   learning_rate: 1e-4
   weight_decay: 1e-3
   num_workers: 8
-  max_epochs: 100
+  max_epochs: 11
   precision: '16-mixed'
   accumulate_grad_batches: 4
   pin_memory: True

@@ -150,6 +150,7 @@ class LightningModel(L.LightningModule):
             'probs': probs,
             'predictions': preds,
             'labels': batch.get('label', None),
+            'song_ids': batch.get('song_id', None),
         }
 
     def configure_optimizers(self):
@@ -182,10 +183,16 @@ def main():
     parser.add_argument('--config', type=str, default='/home/lennon/AI_music/ai_music/configs/SpecTTTra.yaml')
     parser.add_argument('--ablate', nargs='*', default=[], choices=MODALITY_NAMES,
                         help='Modalities to zero out. E.g. --ablate whisper crepe')
-    parser.add_argument('--fusion', type=str, default='cross_attention', choices=['cross_attention', 'concat'],
-                        help='Fusion method. concat replaces cross attention with concat + linear.')
+    parser.add_argument('--fusion', type=str, default='cross_attention',
+                        choices=['cross_attention', 'concat', 'mert_only'],
+                        help='Fusion method. concat replaces cross attention with concat + linear; '
+                             'mert_only ignores the per-modality features and feeds the classifier '
+                             'a ScalarMix-mixed MERT projection (real MERT-only baseline).')
     parser.add_argument('--run_name', type=str, default=None,
                         help='Custom run name for logging. Auto-generated if not provided.')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to a .ckpt to resume training from (restores weights, '
+                             'optimizer, LR scheduler, epoch and global step).')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -197,9 +204,16 @@ def main():
     # Generate run name
     if args.run_name:
         run_name = args.run_name
+    elif args.fusion == 'mert_only':
+        # The real MERT-only baseline (separate fuser, MERT goes straight to
+        # the classifier head). Distinct from the legacy "ablate all 4" route
+        # below, which actually trains a constant-output classifier.
+        run_name = "mert_only"
     elif args.ablate:
         if set(args.ablate) == set(MODALITY_NAMES):
-            run_name = "mert_only"
+            # Legacy path: zeros every post-fusion slot. Kept for reproducibility
+            # of older runs but produces a degenerate classifier.
+            run_name = "mert_only_legacy_ablate"
         else:
             run_name = "ablate_" + "_".join(sorted(args.ablate))
     elif args.fusion == 'concat':
@@ -241,15 +255,9 @@ def main():
     if args.fusion == 'cross_attention':
         fuser = cross_attention.MultiModalMERTFusion(use_layer_mix=True)
     elif args.fusion == 'concat':
-        # If you have a ConcatFusion class, use it here.
-        # Otherwise fall back to cross_attention (you'll need to implement ConcatFusion)
-        try:
-            from ai_music.data.cross_attention import ConcatLinearFusion
-            fuser = ConcatLinearFusion()
-        except ImportError:
-            print("WARNING: ConcatLinearFusion not implemented. Using cross_attention as fallback.")
-            print("TODO: implement ai_music.data.cross_attention.ConcatLinearFusion")
-            fuser = cross_attention.MultiModalMERTFusion(use_layer_mix=True)
+        fuser = cross_attention.ConcatLinearFusion()
+    elif args.fusion == 'mert_only':
+        fuser = cross_attention.MERTOnlyFusion()
     
     # Classifier
     classifier_type = model_config.get('classifier_type', 'ResNet').lower()
@@ -277,7 +285,14 @@ def main():
     model = LightningModel(classifier, fuser, train_config, ablate_modalities=args.ablate)
     print(f"Classifier: {classifier_type}")
     print(f"Ablated: {args.ablate if args.ablate else 'none'}")
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+    trainer.fit(
+        model=model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=args.resume,
+    )
 
 
 if __name__ == '__main__':
